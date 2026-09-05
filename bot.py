@@ -1089,12 +1089,68 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not q:
+        return
+    data = q.data or ""
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    # ── 公开私密分享领取：任何人均可参与，不受管理员白名单拦截 ─────────────────────
+    if data.startswith("share:c:"):
+        code = data.split(":")[-1]
+        ok, msg, share = await store.claim_share(code, user_id)
+        if not ok:
+            await q.answer(msg, show_alert=True)
+            if share and (share["claimed_count"] >= share["max_views"] or share["expire_at"] < int(time.time())):
+                with suppress(Exception):
+                    await q.edit_message_text(
+                        f"🔒 <b>私密分享已失效</b>\n\n原因: {msg}\n来自: {html.escape(share.get('sender_name') or '用户')}",
+                        parse_mode=ParseMode.HTML,
+                    )
+            return
+
+        # 成功：通过原生弹窗独占展示，不发入公屏
+        await q.answer(f"🎁 私密内容：\n\n{share['content']}", show_alert=True)
+
+        # 原地更新卡片进度
+        claimed = share["claimed_count"]
+        max_v = share["max_views"]
+        sender = share.get("sender_name") or "用户"
+        target_uid = share.get("target_user_id")
+
+        if claimed >= max_v:
+            new_text = (
+                "🔒 <b>私密分享 (已领完)</b>\n\n"
+                f"👤 来自: {html.escape(sender)}\n"
+                f"📦 份数: <code>{claimed}/{max_v}</code> (已满)\n"
+                "<i>此分享已全部被领取。</i>"
+            )
+            with suppress(Exception):
+                await q.edit_message_text(new_text, parse_mode=ParseMode.HTML)
+        else:
+            new_text = (
+                "🔒 <b>私密分享</b>\n\n"
+                f"👤 来自: {html.escape(sender)}\n"
+                f"📦 份数: <code>{claimed}/{max_v}</code>\n"
+            )
+            if target_uid:
+                new_text += f"🎯 指定接收人: <code>{target_uid}</code>\n"
+            new_text += "\n<i>点击下方按钮即可查看私密内容（防公开泄漏）。</i>"
+            with suppress(Exception):
+                await q.edit_message_text(
+                    new_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(f"🎁 点击查看 ({claimed}/{max_v})", callback_data=f"share:c:{code}")]
+                    ]),
+                )
+        return
+
+    # 管理员白名单拦截（其余管理指令如删除、刷新、导出必须经过授权）
     if await deny(update):
         return
-    q = update.callback_query
+
     await q.answer()
-    data = q.data or ""
-    user_id = update.effective_user.id
     if data == "noop":
         return
     if data == "list:home":
@@ -1279,56 +1335,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             disable_web_page_preview=True,
         )
         return
-    if data.startswith("share:c:"):
-        code = data.split(":")[-1]
-        ok, msg, share = await store.claim_share(code, user_id)
-        if not ok:
-            await q.answer(msg, show_alert=True)
-            if share and (share["claimed_count"] >= share["max_views"] or share["expire_at"] < int(time.time())):
-                with suppress(Exception):
-                    await q.edit_message_text(
-                        f"🔒 <b>私密分享已失效</b>\n\n原因: {msg}\n来自: {html.escape(share.get('sender_name') or '用户')}",
-                        parse_mode=ParseMode.HTML,
-                    )
-            return
-
-        # 成功：弹窗安全显示真实内容
-        await q.answer(f"🎁 私密内容：\n\n{share['content']}", show_alert=True)
-
-        # 原地更新卡片的领取进度
-        claimed = share["claimed_count"]
-        max_v = share["max_views"]
-        sender = share.get("sender_name") or "用户"
-        target_uid = share.get("target_user_id")
-
-        if claimed >= max_v:
-            new_text = (
-                "🔒 <b>私密分享 (已领完)</b>\n\n"
-                f"👤 来自: {html.escape(sender)}\n"
-                f"📦 份数: <code>{claimed}/{max_v}</code> (已满)\n"
-                "<i>此分享已全部被领取。</i>"
-            )
-            with suppress(Exception):
-                await q.edit_message_text(new_text, parse_mode=ParseMode.HTML)
-        else:
-            new_text = (
-                "🔒 <b>私密分享</b>\n\n"
-                f"👤 来自: {html.escape(sender)}\n"
-                f"📦 份数: <code>{claimed}/{max_v}</code>\n"
-            )
-            if target_uid:
-                new_text += f"🎯 指定接收人: <code>{target_uid}</code>\n"
-            new_text += "\n<i>点击下方按钮即可查看私密内容（防公开泄漏）。</i>"
-            with suppress(Exception):
-                await q.edit_message_text(
-                    new_text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(f"🎁 点击查看 ({claimed}/{max_v})", callback_data=f"share:c:{code}")]
-                    ]),
-                )
-        return
-
     if data.startswith("sub:nodes:"):
         sub_id = int(data.split(":")[-1])
         sub = await store.get_sub(user_id, sub_id)
@@ -1478,73 +1484,99 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if share_parsed:
         max_views, target_user_id, duration_minutes, content = share_parsed
         subs = await store.list_subs(user_id)
+        results: list[InlineQueryResultArticle] = []
 
-        # 尝试将 content 匹配到用户已有的订阅 (支持序号如 '2' / '#2'，或名称匹配)
-        matched_sub = None
+        # 1. 寻找可能匹配的订阅列表 (候选池)
+        candidate_subs: list[tuple[int, dict[str, Any]]] = []
         clean_num = content.lstrip("#").strip()
         if clean_num.isdigit():
             idx = int(clean_num)
             if 1 <= idx <= len(subs):
-                matched_sub = subs[idx - 1]
-        if not matched_sub:
-            # 尝试名称精确或前缀匹配
-            for s in subs:
-                if s["name"].lower() == content.lower() or s["name"].lower().startswith(content.lower()):
-                    matched_sub = s
-                    break
+                candidate_subs.append((idx, subs[idx - 1]))
 
-        if matched_sub:
-            sub_name = matched_sub["name"]
-            sub_clash = sub_token_url(matched_sub["token"], "clash")
+        content_lower = content.lower()
+        for i, s in enumerate(subs, 1):
+            s_name_lower = str(s.get("name") or "").lower()
+            if content_lower in s_name_lower or s_name_lower in content_lower:
+                if not any(c[1]["id"] == s["id"] for c in candidate_subs):
+                    candidate_subs.append((i, s))
+
+        # 为每一个匹配到的订阅生成一个专属私密分享卡片 (最多前 5 个最匹配的)
+        target_hint = f" | 指定: {target_user_id}" if target_user_id else ""
+        for display_idx, sub in candidate_subs[:5]:
+            sub_name = sub["name"]
+            sub_clash = sub_token_url(sub["token"], "clash")
             real_content = (
                 f"🏷️ 订阅名称：{sub_name}\n"
-                f"🌐 原始链接：{matched_sub['url']}\n"
+                f"🌐 原始链接：{sub['url']}\n"
                 f"⚡ Clash 配置：{sub_clash}"
             )
-            item_desc = f"分享订阅: {sub_name}"
-        else:
-            sub_name = None
-            real_content = content
-            item_desc = f"内容: {content[:30]}…" if len(content) > 30 else f"内容: {content}"
+            code = await store.create_share(
+                sender_id=user_id,
+                sender_name=user_name,
+                content=real_content,
+                max_views=max_views,
+                target_user_id=target_user_id,
+                duration_minutes=duration_minutes,
+            )
+            card_title = f"🔒 分享订阅: #{display_idx} {sub_name} (限{max_views}份/{duration_minutes}m{target_hint})"
+            card_desc = f"原始链接: {sub['url'][:50]}…"
+            msg_text = (
+                "🔒 <b>私密分享</b>\n\n"
+                f"👤 来自: {html.escape(user_name)}\n"
+                f"🏷️ 订阅项目: <b>{html.escape(sub_name)}</b>\n"
+                f"📦 份数: <code>0/{max_views}</code>\n"
+                f"⏳ 有效期: <code>{duration_minutes} 分钟</code>\n"
+            )
+            if target_user_id:
+                msg_text += f"🎯 指定接收人: <code>{target_user_id}</code>\n"
+            msg_text += "\n<i>点击下方按钮即可查看私密内容（防公开泄漏）。</i>"
 
-        code = await store.create_share(
+            results.append(
+                InlineQueryResultArticle(
+                    id=f"share_sub_{code}",
+                    title=card_title[:64],
+                    description=card_desc[:100],
+                    input_message_content=InputTextMessageContent(msg_text, parse_mode=ParseMode.HTML),
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🎁 点击查看内容", callback_data=f"share:c:{code}")]
+                    ]),
+                )
+            )
+
+        # 2. 永远追加一张“按原始文本内容分享”的卡片 (兜底或纯文字分享)
+        code_text = await store.create_share(
             sender_id=user_id,
             sender_name=user_name,
-            content=real_content,
+            content=content,
             max_views=max_views,
             target_user_id=target_user_id,
             duration_minutes=duration_minutes,
         )
-        target_hint = f" | 指定: {target_user_id}" if target_user_id else ""
-        sub_hint = f": {sub_name}" if sub_name else ""
-        card_title = f"🔒 私密分享{sub_hint} (限{max_views}份/{duration_minutes}分钟{target_hint})"
-        card_desc = item_desc
-        msg_text = (
+        card_title_text = f"🔒 分享自定义内容 (限{max_views}份/{duration_minutes}m{target_hint})"
+        card_desc_text = f"文本: {content[:35]}…" if len(content) > 35 else f"文本: {content}"
+        msg_text_custom = (
             "🔒 <b>私密分享</b>\n\n"
             f"👤 来自: {html.escape(user_name)}\n"
-        )
-        if sub_name:
-            msg_text += f"🏷️ 订阅项目: <b>{html.escape(sub_name)}</b>\n"
-        msg_text += (
             f"📦 份数: <code>0/{max_views}</code>\n"
             f"⏳ 有效期: <code>{duration_minutes} 分钟</code>\n"
         )
         if target_user_id:
-            msg_text += f"🎯 指定接收人: <code>{target_user_id}</code>\n"
-        msg_text += "\n<i>点击下方按钮即可查看私密内容（防公开泄漏）。</i>"
+            msg_text_custom += f"🎯 指定接收人: <code>{target_user_id}</code>\n"
+        msg_text_custom += "\n<i>点击下方按钮即可查看私密内容（防公开泄漏）。</i>"
 
-        share_kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎁 点击查看内容", callback_data=f"share:c:{code}")]
-        ])
-        results = [
+        results.append(
             InlineQueryResultArticle(
-                id=f"share_{code}",
-                title=card_title[:64],
-                description=card_desc[:100],
-                input_message_content=InputTextMessageContent(msg_text, parse_mode=ParseMode.HTML),
-                reply_markup=share_kb,
+                id=f"share_txt_{code_text}",
+                title=card_title_text[:64],
+                description=card_desc_text[:100],
+                input_message_content=InputTextMessageContent(msg_text_custom, parse_mode=ParseMode.HTML),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎁 点击查看内容", callback_data=f"share:c:{code_text}")]
+                ]),
             )
-        ]
+        )
+
         await iq.answer(results, cache_time=1, is_personal=True)
         return
 
