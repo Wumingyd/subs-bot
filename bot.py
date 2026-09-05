@@ -13,6 +13,7 @@ from urllib.parse import quote_plus, urlparse
 import aiohttp
 from aiohttp import web
 from telegram import (
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
@@ -342,8 +343,42 @@ async def render_list(user_id: int, page: int = 0, sort_mode: str = "默认") ->
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ── 检查是否有私密分享单次临时授权参数 (claim_{code}) ────────────────────────────
+    args = context.args or []
+    if args and args[0].startswith("claim_"):
+        code = args[0][6:]
+        user_id = update.effective_user.id if update.effective_user else 0
+        ok, msg, share = await store.claim_share(code, user_id)
+        if not ok:
+            await update.effective_message.reply_html(
+                f"🔒 <b>私密分享领取失败</b>\n\n原因: <code>{html.escape(msg)}</code>\n\n"
+                "<i>此分享可能已被领完、已过期或限制了指定接收人。</i>"
+            )
+            return
+
+        sender = html.escape(share.get("sender_name") or "用户")
+        claimed = share.get("claimed_count", 1)
+        max_v = share.get("max_views", 1)
+        split_body, copy_btns = format_split_share_content(share["content"])
+        resp_text = (
+            "🎁 <b>您已成功领取私密分享：</b>\n\n"
+            f"👤 来自: {sender}\n"
+            f"📦 领取进度: <code>{claimed}/{max_v}</code>\n\n"
+            f"{split_body}\n\n"
+            "💡 <b>各字段已单独隔离，点击下方独立复制按钮，或轻触对应灰框均可单独复制。</b>\n"
+            "<i>（本次为单次私密提取临时授权，不包含 Bot 管理员权限）</i>"
+        )
+        await update.effective_message.reply_html(
+            resp_text,
+            reply_markup=InlineKeyboardMarkup(copy_btns) if copy_btns else None,
+            disable_web_page_preview=True,
+        )
+        return
+
+    # 无单次授权参数时，严格执行管理员白名单检查
     if await deny(update):
         return
+
     name = update.effective_user.first_name or "用户"
     await update.effective_message.reply_text(
         f"👋 你好，{name}！\n\n"
@@ -1109,20 +1144,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     )
             return
 
-        # 成功：尝试通过私聊把内容发给他 (带有 <code> 标签，点击即可一键复制)
+        # 成功：尝试通过私聊把内容发给他 (各字段独立隔离 + 专属单项复制按钮)
         sent_pm = False
         pm_err = ""
+        split_body, copy_btns = format_split_share_content(share["content"])
         pm_text = (
             "🎁 <b>您领取的私密分享内容如下：</b>\n"
             f"👤 来自: {html.escape(share.get('sender_name') or '用户')}\n\n"
-            f"<code>{html.escape(share['content'])}</code>\n\n"
-            "<i>💡 点击上方文字即可一键复制到剪贴板。</i>"
+            f"{split_body}\n\n"
+            "<i>💡 各项已做物理隔离，轻触上方独立灰框或点击下方按钮，仅复制单项。</i>"
         )
         try:
             await context.bot.send_message(
                 chat_id=user_id,
                 text=pm_text,
                 parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(copy_btns) if copy_btns else None,
                 disable_web_page_preview=True,
             )
             sent_pm = True
@@ -1132,14 +1169,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if sent_pm:
             alert_msg = (
                 f"🎁 领取成功！\n\n"
-                f"完整内容已私信发送到 @{BOT_USERNAME}，点击私信代码框即可一键复制！\n\n"
-                f"内容预览：\n{share['content']}"
+                f"内容已私信发送到 @{BOT_USERNAME}，并提供独立单项复制按钮，防止连带全选！\n\n"
+                f"预览：\n{share['content']}"
             )
         else:
             alert_msg = (
                 f"🎁 领取成功！\n\n"
                 f"{share['content']}\n\n"
-                f"⚠️ 无法向您发送私信（请先点击 @{BOT_USERNAME} 发送 /start 启用私聊后即可一键复制）"
+                f"⚠️ 无法向您发送私信（请先点击 @{BOT_USERNAME} 发送 /start 启用私聊后即可独立复制单项）"
             )
 
         # 截断防超过 Telegram 弹窗字数限制
@@ -1467,6 +1504,53 @@ async def start_http(app: Application) -> web.AppRunner:
     return runner
 
 
+def format_split_share_content(raw_content: str) -> tuple[str, list[list[InlineKeyboardButton]]]:
+    """把私密分享内容格式化为彼此隔离的独立代码框，并生成专属单项复制按钮，防止连带全选。"""
+    lines = [line.strip() for line in raw_content.splitlines() if line.strip()]
+    copy_buttons: list[list[InlineKeyboardButton]] = []
+    body_parts: list[str] = []
+
+    # 1. 检测是否为格式化的订阅包（含名称、原链、Clash配置等）
+    is_sub_pack = any("原始链接" in l or "Clash 配置" in l for l in lines)
+    if is_sub_pack:
+        for l in lines:
+            if "：" in l:
+                label, _, val = l.partition("：")
+            elif ":" in l:
+                label, _, val = l.partition(":")
+            else:
+                label, val = "内容", l
+            label = label.strip()
+            val = val.strip()
+            if not val:
+                continue
+
+            # 每一项单独使用代码框包裹，并且中间空一行做物理隔离
+            body_parts.append(f"<b>{html.escape(label)}：</b>\n<code>{html.escape(val)}</code>")
+
+            # 如果是具体链接或名称，挂一个独立的复制按钮
+            btn_title = f"📋 复制{label[:6]}"
+            copy_buttons.append([InlineKeyboardButton(btn_title, copy_text=CopyTextButton(text=val))])
+
+        body_text = "\n\n".join(body_parts)
+        return body_text, copy_buttons
+
+    # 2. 检测是否为多行节点或多条链接
+    if len(lines) > 1:
+        for i, l in enumerate(lines, 1):
+            body_parts.append(f"<b>片段 #{i}：</b>\n<code>{html.escape(l)}</code>")
+            if i <= 8:  # 限制按钮行数，防消息过长
+                copy_buttons.append([InlineKeyboardButton(f"📋 复制片段 #{i}", copy_text=CopyTextButton(text=l))])
+        body_text = "\n\n".join(body_parts)
+        return body_text, copy_buttons
+
+    # 3. 单条内容：单一隔离框 + 单一复制按钮
+    single_val = raw_content.strip()
+    body_text = f"<b>内容如下：</b>\n<code>{html.escape(single_val)}</code>"
+    copy_buttons.append([InlineKeyboardButton("📋 一键复制内容", copy_text=CopyTextButton(text=single_val))])
+    return body_text, copy_buttons
+
+
 def parse_share_query(raw: str) -> tuple[int, int | None, int, str] | None:
     """Parse ``Share [x份数] [id用户ID] [s分钟] 内容`` syntax."""
     s = raw.strip()
@@ -1572,7 +1656,8 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     description=card_desc[:100],
                     input_message_content=InputTextMessageContent(msg_text, parse_mode=ParseMode.HTML),
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🎁 点击查看内容", callback_data=f"share:c:{code}")]
+                        [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{BOT_USERNAME}?start=claim_{code}")],
+                        [InlineKeyboardButton("👀 快速弹窗预览", callback_data=f"share:c:{code}")],
                     ]),
                 )
             )
@@ -1605,7 +1690,8 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 description=card_desc_text[:100],
                 input_message_content=InputTextMessageContent(msg_text_custom, parse_mode=ParseMode.HTML),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎁 点击查看内容", callback_data=f"share:c:{code_text}")]
+                    [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{BOT_USERNAME}?start=claim_{code_text}")],
+                    [InlineKeyboardButton("👀 快速弹窗预览", callback_data=f"share:c:{code_text}")],
                 ]),
             )
         )
