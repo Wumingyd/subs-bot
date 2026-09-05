@@ -68,6 +68,16 @@ log = logging.getLogger("subs-bot")
 
 store = Store()
 
+CURRENT_BOT_USERNAME = str(BOT_USERNAME or "").lstrip("@")
+
+
+def get_bot_username(bot: Any = None) -> str:
+    global CURRENT_BOT_USERNAME
+    if bot and getattr(bot, "username", None):
+        CURRENT_BOT_USERNAME = str(bot.username).lstrip("@")
+    return CURRENT_BOT_USERNAME or "bot"
+
+
 ALLOWED_DOCUMENT_SUFFIXES = frozenset({".txt", ".log", ".yaml", ".yml", ".json"})
 
 
@@ -1166,17 +1176,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception as e:
             pm_err = str(e)
 
+        bot_user = get_bot_username(context.bot)
         if sent_pm:
             alert_msg = (
                 f"🎁 领取成功！\n\n"
-                f"内容已私信发送到 @{BOT_USERNAME}，并提供独立单项复制按钮，防止连带全选！\n\n"
+                f"内容已私信发送到 @{bot_user}，并提供独立单项复制按钮，防止连带全选！\n\n"
                 f"预览：\n{share['content']}"
             )
         else:
             alert_msg = (
                 f"🎁 领取成功！\n\n"
                 f"{share['content']}\n\n"
-                f"⚠️ 无法向您发送私信（请先点击 @{BOT_USERNAME} 发送 /start 启用私聊后即可独立复制单项）"
+                f"⚠️ 无法向您发送私信（请先点击 @{bot_user} 发送 /start 启用私聊后即可独立复制单项）"
             )
 
         # 截断防超过 Telegram 弹窗字数限制
@@ -1618,6 +1629,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 if not any(c[1]["id"] == s["id"] for c in candidate_subs):
                     candidate_subs.append((i, s))
 
+        bot_username = get_bot_username(context.bot)
         # 为每一个匹配到的订阅生成一个专属私密分享卡片 (最多前 5 个最匹配的)
         target_hint = f" | 指定: {target_user_id}" if target_user_id else ""
         for display_idx, sub in candidate_subs[:5]:
@@ -1656,7 +1668,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     description=card_desc[:100],
                     input_message_content=InputTextMessageContent(msg_text, parse_mode=ParseMode.HTML),
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{BOT_USERNAME}?start=claim_{code}")],
+                        [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{bot_username}?start=claim_{code}")],
                         [InlineKeyboardButton("👀 快速弹窗预览", callback_data=f"share:c:{code}")],
                     ]),
                 )
@@ -1690,7 +1702,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 description=card_desc_text[:100],
                 input_message_content=InputTextMessageContent(msg_text_custom, parse_mode=ParseMode.HTML),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{BOT_USERNAME}?start=claim_{code_text}")],
+                    [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{bot_username}?start=claim_{code_text}")],
                     [InlineKeyboardButton("👀 快速弹窗预览", callback_data=f"share:c:{code_text}")],
                 ]),
             )
@@ -1773,6 +1785,16 @@ async def amain() -> None:
         log.info("Bot starting...")
         await app.initialize()
         await app.start()
+
+        # 启动后从官方自动校准真实 Bot Username，彻底杜绝跳错频道
+        try:
+            me = await app.bot.get_me()
+            if me and me.username:
+                get_bot_username(me)
+                log.info("Bot username calibrated: @%s", CURRENT_BOT_USERNAME)
+        except Exception as e:
+            log.warning("Failed to calibrate bot username from API: %s", e)
+
         await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
         # run forever
         while True:
