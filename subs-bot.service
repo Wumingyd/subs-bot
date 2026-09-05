@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Subs Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/subs-bot
+EnvironmentFile=/opt/subs-bot/.env
+ExecStart=/opt/subs-bot/.venv/bin/python /opt/subs-bot/bot.py
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
