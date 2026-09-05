@@ -1109,8 +1109,41 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     )
             return
 
-        # 成功：通过原生弹窗独占展示，不发入公屏
-        await q.answer(f"🎁 私密内容：\n\n{share['content']}", show_alert=True)
+        # 成功：尝试通过私聊把内容发给他 (带有 <code> 标签，点击即可一键复制)
+        sent_pm = False
+        pm_err = ""
+        pm_text = (
+            "🎁 <b>您领取的私密分享内容如下：</b>\n"
+            f"👤 来自: {html.escape(share.get('sender_name') or '用户')}\n\n"
+            f"<code>{html.escape(share['content'])}</code>\n\n"
+            "<i>💡 点击上方文字即可一键复制到剪贴板。</i>"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=pm_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            sent_pm = True
+        except Exception as e:
+            pm_err = str(e)
+
+        if sent_pm:
+            alert_msg = (
+                f"🎁 领取成功！\n\n"
+                f"完整内容已私信发送到 @{BOT_USERNAME}，点击私信代码框即可一键复制！\n\n"
+                f"内容预览：\n{share['content']}"
+            )
+        else:
+            alert_msg = (
+                f"🎁 领取成功！\n\n"
+                f"{share['content']}\n\n"
+                f"⚠️ 无法向您发送私信（请先点击 @{BOT_USERNAME} 发送 /start 启用私聊后即可一键复制）"
+            )
+
+        # 截断防超过 Telegram 弹窗字数限制
+        await q.answer(alert_msg[:190], show_alert=True)
 
         # 原地更新卡片进度
         claimed = share["claimed_count"]
