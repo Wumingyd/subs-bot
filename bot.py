@@ -1477,20 +1477,55 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     share_parsed = parse_share_query(raw_query)
     if share_parsed:
         max_views, target_user_id, duration_minutes, content = share_parsed
+        subs = await store.list_subs(user_id)
+
+        # 尝试将 content 匹配到用户已有的订阅 (支持序号如 '2' / '#2'，或名称匹配)
+        matched_sub = None
+        clean_num = content.lstrip("#").strip()
+        if clean_num.isdigit():
+            idx = int(clean_num)
+            if 1 <= idx <= len(subs):
+                matched_sub = subs[idx - 1]
+        if not matched_sub:
+            # 尝试名称精确或前缀匹配
+            for s in subs:
+                if s["name"].lower() == content.lower() or s["name"].lower().startswith(content.lower()):
+                    matched_sub = s
+                    break
+
+        if matched_sub:
+            sub_name = matched_sub["name"]
+            sub_clash = sub_token_url(matched_sub["token"], "clash")
+            real_content = (
+                f"🏷️ 订阅名称：{sub_name}\n"
+                f"🌐 原始链接：{matched_sub['url']}\n"
+                f"⚡ Clash 配置：{sub_clash}"
+            )
+            item_desc = f"分享订阅: {sub_name}"
+        else:
+            sub_name = None
+            real_content = content
+            item_desc = f"内容: {content[:30]}…" if len(content) > 30 else f"内容: {content}"
+
         code = await store.create_share(
             sender_id=user_id,
             sender_name=user_name,
-            content=content,
+            content=real_content,
             max_views=max_views,
             target_user_id=target_user_id,
             duration_minutes=duration_minutes,
         )
         target_hint = f" | 指定: {target_user_id}" if target_user_id else ""
-        card_title = f"🔒 创建私密分享 (限{max_views}份/{duration_minutes}分钟{target_hint})"
-        card_desc = f"内容: {content[:30]}…" if len(content) > 30 else f"内容: {content}"
+        sub_hint = f": {sub_name}" if sub_name else ""
+        card_title = f"🔒 私密分享{sub_hint} (限{max_views}份/{duration_minutes}分钟{target_hint})"
+        card_desc = item_desc
         msg_text = (
             "🔒 <b>私密分享</b>\n\n"
             f"👤 来自: {html.escape(user_name)}\n"
+        )
+        if sub_name:
+            msg_text += f"🏷️ 订阅项目: <b>{html.escape(sub_name)}</b>\n"
+        msg_text += (
             f"📦 份数: <code>0/{max_views}</code>\n"
             f"⏳ 有效期: <code>{duration_minutes} 分钟</code>\n"
         )
