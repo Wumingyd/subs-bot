@@ -228,11 +228,21 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
     remain_traffic = None
     if used is not None and total is not None:
         remain_traffic = max(total - used, 0)
-    node_preview = "\n".join(
-        f"• {html.escape(str(n.get('name') or '未命名'))}" for n in nodes[:12]
-    ) or "未解析到节点"
-    if len(nodes) > 12:
-        node_preview += f"\n… 另有 {len(nodes) - 12} 个"
+
+    # 采用可展开的引用块 (expandable blockquote)，直接展示全量节点，客户端可原生点击下拉展开
+    # 为防极端大库（例如上千节点）撑爆 Telegram 单消息 4096 字符硬限制，安全展示前 60 个
+    display_limit = 60
+    display_nodes = nodes[:display_limit]
+    node_lines = [
+        f"• {html.escape(str(n.get('name') or '未命名'))}" for n in display_nodes
+    ]
+    if not node_lines:
+        node_preview = "未解析到节点"
+    else:
+        if len(nodes) > display_limit:
+            node_lines.append(f"\n<i>（前 {display_limit} 个已展示，点击下方按钮可翻页浏览全量 {len(nodes)} 个节点）</i>")
+        node_preview = "\n".join(node_lines)
+
     err = sub.get("last_error")
     err_line = f"\n⚠️ 刷新错误: {html.escape(err)}" if err else ""
     return (
@@ -243,34 +253,37 @@ def detail_text(sub: dict[str, Any], idx: int) -> str:
         f"剩余可用: {html.escape(format_bytes_gb(remain_traffic))}\n"
         f"过期时间: {html.escape(format_expire(sub.get('expire_at')))}\n"
         f"剩余时间: {html.escape(remain_text(sub.get('expire_at')))}\n"
-        f"📡 节点列表 ({len(nodes)}):\n<blockquote>{node_preview}</blockquote>"
+        f"📡 节点列表 ({len(nodes)} 个，支持下拉展开):\n<blockquote expandable>{node_preview}</blockquote>"
         f"{err_line}"
     )
 
 
-def detail_keyboard(sub_id: int, page: int = 0) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
+def detail_keyboard(sub_id: int, page: int = 0, node_count: int = 0) -> InlineKeyboardMarkup:
+    rows = [
         [
-            [
-                InlineKeyboardButton("Clash Meta", callback_data=f"sub:fmt:{sub_id}:clash"),
-                InlineKeyboardButton("Sing-box", callback_data=f"sub:fmt:{sub_id}:singbox"),
-            ],
-            [
-                InlineKeyboardButton("Base64", callback_data=f"sub:fmt:{sub_id}:base64"),
-                InlineKeyboardButton("Surge", callback_data=f"sub:fmt:{sub_id}:surge"),
-            ],
-            [InlineKeyboardButton("QX", callback_data=f"sub:fmt:{sub_id}:qx")],
-            [InlineKeyboardButton("🔄 刷新订阅", callback_data=f"sub:refresh:{sub_id}:{page}")],
-            [
-                InlineKeyboardButton("📦 导出节点", callback_data=f"sub:nodes:{sub_id}"),
-                InlineKeyboardButton("🔗 生成短链", callback_data=f"sub:short:{sub_id}"),
-            ],
-            [
-                InlineKeyboardButton("🗑 删除订阅", callback_data=f"sub:delask:{sub_id}:{page}"),
-                InlineKeyboardButton("⬅️ 返回列表", callback_data=f"sub:back:{page}"),
-            ],
-        ]
-    )
+            InlineKeyboardButton("Clash Meta", callback_data=f"sub:fmt:{sub_id}:clash"),
+            InlineKeyboardButton("Sing-box", callback_data=f"sub:fmt:{sub_id}:singbox"),
+        ],
+        [
+            InlineKeyboardButton("Base64", callback_data=f"sub:fmt:{sub_id}:base64"),
+            InlineKeyboardButton("Surge", callback_data=f"sub:fmt:{sub_id}:surge"),
+        ],
+        [InlineKeyboardButton("QX", callback_data=f"sub:fmt:{sub_id}:qx")],
+        [InlineKeyboardButton("🔄 刷新订阅", callback_data=f"sub:refresh:{sub_id}:{page}")],
+        [
+            InlineKeyboardButton("📦 导出节点", callback_data=f"sub:nodes:{sub_id}"),
+            InlineKeyboardButton("🔗 生成短链", callback_data=f"sub:short:{sub_id}"),
+        ],
+    ]
+    if node_count > 0:
+        rows.append([
+            InlineKeyboardButton(f"📡 浏览全部节点 ({node_count}个)", callback_data=f"sub:vn:{sub_id}:{page}:0")
+        ])
+    rows.append([
+        InlineKeyboardButton("🗑 删除订阅", callback_data=f"sub:delask:{sub_id}:{page}"),
+        InlineKeyboardButton("⬅️ 返回列表", callback_data=f"sub:back:{page}"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 def list_keyboard(page: int, total: int, page_size: int = 8, items: list[tuple[int, dict[str, Any]]] | None = None) -> InlineKeyboardMarkup:
@@ -883,9 +896,10 @@ async def show_detail(update: Update, user_id: int, idx: int, page: int = 0) -> 
     sub = subs[idx - 1]
     if not nodes_of(sub):
         sub = await refresh_sub(user_id, sub)
+    nodes = nodes_of(sub)
     await update.effective_message.reply_html(
         detail_text(sub, idx),
-        reply_markup=detail_keyboard(int(sub["id"]), page),
+        reply_markup=detail_keyboard(int(sub["id"]), page, len(nodes)),
         disable_web_page_preview=True,
     )
 
@@ -1347,7 +1361,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.edit_message_text(
             detail_text(sub, idx),
             parse_mode=ParseMode.HTML,
-            reply_markup=detail_keyboard(sub_id, page),
+            reply_markup=detail_keyboard(sub_id, page, len(nodes_of(sub))),
             disable_web_page_preview=True,
         )
         return
@@ -1359,6 +1373,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         else:
             await q.edit_message_text("恢复失败，记录可能已过期。")
         return
+    if data.startswith("sub:vn:"):
+        parts = data.split(":")
+        sub_id = int(parts[2])
+        list_page = int(parts[3]) if len(parts) > 3 else 0
+        node_page = int(parts[4]) if len(parts) > 4 else 0
+        sub = await store.get_sub(user_id, sub_id)
+        if not sub:
+            await q.edit_message_text("订阅不存在")
+            return
+        nodes = nodes_of(sub)
+        if not nodes:
+            await q.answer("该订阅当前未解析到节点", show_alert=True)
+            return
+
+        node_page_size = 15
+        total_pages = max(1, (len(nodes) + node_page_size - 1) // node_page_size)
+        node_page = max(0, min(node_page, total_pages - 1))
+        start_idx = node_page * node_page_size
+        chunk_nodes = nodes[start_idx : start_idx + node_page_size]
+
+        lines = [
+            f"📡 <b>节点浏览：{html.escape(sub['name'])}</b>",
+            f"<i>共 {len(nodes)} 个节点 ｜ 第 {node_page + 1}/{total_pages} 页</i>\n",
+        ]
+        for i, n in enumerate(chunk_nodes, start=start_idx + 1):
+            n_type = html.escape(str(n.get("type") or "node")).upper()
+            n_name = html.escape(str(n.get("name") or "未命名"))
+            lines.append(f"<code>#{i:02d}</code> [{n_type}] <b>{n_name}</b>")
+
+        nav_row: list[InlineKeyboardButton] = []
+        if node_page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️ 上页", callback_data=f"sub:vn:{sub_id}:{list_page}:{node_page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"📄 {node_page + 1}/{total_pages}", callback_data="noop"))
+        if node_page + 1 < total_pages:
+            nav_row.append(InlineKeyboardButton("下页 ➡️", callback_data=f"sub:vn:{sub_id}:{list_page}:{node_page + 1}"))
+
+        kb_rows = []
+        if total_pages > 1:
+            kb_rows.append(nav_row)
+        kb_rows.append([
+            InlineKeyboardButton("⬅️ 返回订阅详情", callback_data=f"sub:open:{sub_id}:{list_page}")
+        ])
+
+        await q.edit_message_text(
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(kb_rows),
+            disable_web_page_preview=True,
+        )
+        return
+
     if data.startswith("sub:back:"):
         page = int(data.split(":")[-1])
         text, kb = await render_list(user_id, page)
@@ -1404,7 +1469,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.edit_message_text(
             detail_text(sub, idx),
             parse_mode=ParseMode.HTML,
-            reply_markup=detail_keyboard(sub_id, page),
+            reply_markup=detail_keyboard(sub_id, page, len(nodes_of(sub))),
             disable_web_page_preview=True,
         )
         return
