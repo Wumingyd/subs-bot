@@ -815,61 +815,127 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_github_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Search public GitHub code, with grep.app fallback for unauthenticated limits."""
+    """高可用 GitHub 搜索：并发检索代码片段与热门开源仓库，并提供网页直达按钮。"""
     if await deny(update):
         return
     query = " ".join(context.args or []).strip()
     if not query:
-        await update.effective_message.reply_text("用法：/g 关键词或链接", reply_markup=MAIN_KB)
+        await update.effective_message.reply_text("用法：/g 关键词或开源项目名称\n例如：/g clash 或 /g subs-bot", reply_markup=MAIN_KB)
         return
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "subs-bot"}
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    results: list[dict[str, Any]] = []
+
+    repos_results: list[dict[str, Any]] = []
+    code_results: list[dict[str, Any]] = []
     source = "GitHub"
+
     try:
-        timeout = aiohttp.ClientTimeout(total=12)
+        timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            url = "https://api.github.com/search/code?q=" + quote_plus(query) + "&per_page=10"
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    payload = await resp.json(content_type=None)
-                    results = payload.get("items") or []
-                elif resp.status not in (401, 403, 422):
-                    log.warning("GitHub code search HTTP %s", resp.status)
-            if not results:
-                source = "grep.app"
-                async with session.get(
-                    "https://grep.app/api/search?q=" + quote_plus(query) + "&regexp=false"
-                ) as resp:
+            # 1. 优先搜索高赞开源仓库 (免 Token 100% 可用)
+            repo_url = f"https://api.github.com/search/repositories?q={quote_plus(query)}&sort=stars&order=desc&per_page=5"
+            try:
+                async with session.get(repo_url) as resp:
                     if resp.status == 200:
                         payload = await resp.json(content_type=None)
-                        results = payload.get("hits", {}).get("hits", [])
+                        repos_results = payload.get("items") or []
+            except Exception as e:
+                log.warning("GitHub repo search failed: %s", e)
+
+            # 2. 搜索公开代码 (有 Token 优先，无 Token 带扩展名)
+            code_query = query
+            if not GITHUB_TOKEN and " " not in query:
+                code_query = f"{query} extension:yaml extension:txt"
+            code_url = f"https://api.github.com/search/code?q={quote_plus(code_query)}&per_page=5"
+            try:
+                async with session.get(code_url) as resp:
+                    if resp.status == 200:
+                        payload = await resp.json(content_type=None)
+                        code_results = payload.get("items") or []
+            except Exception as e:
+                log.warning("GitHub code search failed: %s", e)
+
+            # 3. 如果代码为空，尝试备用 grep.app
+            if not code_results:
+                try:
+                    async with session.get(
+                        f"https://grep.app/api/search?q={quote_plus(query)}&regexp=false"
+                    ) as resp:
+                        if resp.status == 200:
+                            payload = await resp.json(content_type=None)
+                            grep_items = payload.get("hits", {}).get("hits", [])
+                            if grep_items:
+                                source = "grep.app"
+                                code_results = grep_items[:5]
+                except Exception:
+                    pass
+
     except Exception as exc:
-        log.warning("code search failed: %s", exc)
-    if not results:
-        await update.effective_message.reply_text("没有找到公开代码，或搜索服务暂时不可用。", reply_markup=MAIN_KB)
+        log.warning("GitHub multi-search error: %s", exc)
+
+    if not repos_results and not code_results:
+        # 即使接口完全触发官方限流，依然提供一键直达网页结果的按钮
+        web_search_url = f"https://github.com/search?q={quote_plus(query)}&type=code"
+        btn_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌐 点击在 GitHub 网页查看代码结果", url=web_search_url)]
+        ])
+        await update.effective_message.reply_html(
+            f"🔎 <b>GitHub 搜索</b>\n关键词：<code>{html.escape(query)}</code>\n\n"
+            "⚠️ 当前官方搜索 API 暂受频控限制，已为您生成网页端专属查询直链：",
+            reply_markup=btn_kb,
+            disable_web_page_preview=True,
+        )
         return
-    lines = [f"🔎 <b>GitHub 代码搜索</b>（{source}）\n关键词：<code>{html.escape(query)}</code>\n"]
-    for item in results[:10]:
-        if source == "GitHub":
-            repo = item.get("repository") or {}
-            full_name = repo.get("full_name") or "unknown"
-            path = item.get("path") or ""
-            html_url = item.get("html_url") or ""
-        else:
-            repo = item.get("repo") or {}
-            full_name = repo.get("raw") or repo.get("name") or "unknown"
-            path = item.get("path") or ""
-            html_url = item.get("content", {}).get("url") or (
-                f"https://github.com/{full_name}/blob/HEAD/{path}" if path else ""
-            )
-        title = f"{full_name}/{path}" if path else full_name
-        if html_url:
-            lines.append(f"• <a href=\"{html.escape(html_url, quote=True)}\">{html.escape(title)}</a>")
-        else:
-            lines.append(f"• {html.escape(title)}")
-    await update.effective_message.reply_html("\n".join(lines), reply_markup=MAIN_KB, disable_web_page_preview=True)
+
+    lines = [f"🔎 <b>GitHub 搜索结果</b>\n关键词：<code>{html.escape(query)}</code>\n"]
+
+    # 展示热门开源项目
+    if repos_results:
+        lines.append("📦 <b>热门开源仓库：</b>")
+        for r in repos_results:
+            full_name = html.escape(str(r.get("full_name") or "unknown"))
+            html_url = r.get("html_url") or ""
+            stars = r.get("stargazers_count", 0)
+            star_str = f"⭐ {stars / 1000:.1f}k" if stars >= 1000 else f"⭐ {stars}"
+            desc = html.escape(str(r.get("description") or "无项目描述").strip())
+            desc_short = desc[:45] + "…" if len(desc) > 45 else desc
+            lines.append(f"• <a href=\"{html.escape(html_url, quote=True)}\"><b>{full_name}</b></a> ({star_str})\n  <i>{desc_short}</i>")
+        lines.append("")
+
+    # 展示代码搜索匹配项
+    if code_results:
+        lines.append(f"📄 <b>相关公开代码（{source}）：</b>")
+        for item in code_results:
+            if source == "GitHub":
+                repo = item.get("repository") or {}
+                repo_name = repo.get("full_name") or "unknown"
+                path = item.get("path") or ""
+                html_url = item.get("html_url") or ""
+            else:
+                repo = item.get("repo") or {}
+                repo_name = repo.get("raw") or repo.get("name") or "unknown"
+                path = item.get("path") or ""
+                html_url = f"https://github.com/{repo_name}/blob/HEAD/{path}" if path else ""
+            title = f"{repo_name}/{path}" if path else repo_name
+            if html_url:
+                lines.append(f"• <a href=\"{html.escape(html_url, quote=True)}\">{html.escape(title)}</a>")
+            else:
+                lines.append(f"• {html.escape(title)}")
+
+    web_url = f"https://github.com/search?q={quote_plus(query)}&type=code"
+    action_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 在 GitHub 查看更多代码结果", url=web_url)]
+    ])
+    await update.effective_message.reply_html(
+        "\n".join(lines),
+        reply_markup=action_kb,
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_temp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
