@@ -1464,14 +1464,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.message.reply_text(f"您是否要更新 {n} 条订阅？", reply_markup=keyboard)
         return
     if data == "upd:cancel":
-        await q.edit_message_text("已取消更新。", reply_markup=MAIN_KB)
+        cancel_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ]
+        ])
+        with suppress(Exception):
+            await q.edit_message_text("已取消更新。", reply_markup=cancel_kb)
         return
     if data == "upd:run":
         await q.edit_message_text("🔄 开始更新所有订阅…")
         await run_update_all(update, context)
         return
     if data == "upd:keepfailed":
-        await q.edit_message_text("已保留失效订阅。", reply_markup=MAIN_KB)
+        keep_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ]
+        ])
+        with suppress(Exception):
+            await q.edit_message_text("已保留失效订阅。", reply_markup=keep_kb)
         return
     if data == "upd:delfailed":
         subs = await store.list_subs(user_id)
@@ -1480,7 +1494,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if sub.get("last_error"):
                 if await store.delete_sub(user_id, int(sub["id"])):
                     removed += 1
-        await q.edit_message_text(f"✅ 已删除 {removed} 条失效订阅。", reply_markup=MAIN_KB)
+        done_kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📦 订阅列表", callback_data="list:page:0"),
+                InlineKeyboardButton("🏠 主菜单", callback_data="list:home"),
+            ]
+        ])
+        with suppress(Exception):
+            await q.edit_message_text(f"✅ 已删除 {removed} 条失效订阅。", reply_markup=done_kb)
         return
     if data.startswith("list:page:"):
         page = int(data.split(":")[-1])
