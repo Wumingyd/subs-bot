@@ -370,18 +370,17 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         sender = html.escape(share.get("sender_name") or "用户")
         claimed = share.get("claimed_count", 1)
         max_v = share.get("max_views", 1)
-        split_body, copy_btns = format_split_share_content(share["content"])
+        split_body = format_split_share_content(share["content"])
         resp_text = (
             "🎁 <b>您已成功领取私密分享：</b>\n\n"
             f"👤 来自: {sender}\n"
             f"📦 领取进度: <code>{claimed}/{max_v}</code>\n\n"
             f"{split_body}\n\n"
-            "💡 <b>各字段已单独隔离，点击下方独立复制按钮，或轻触对应灰框均可单独复制。</b>\n"
+            "💡 <b>轻触上方灰底内容即可直接复制。</b>\n"
             "<i>（本次为单次私密提取临时授权，不包含 Bot 管理员权限）</i>"
         )
         await update.effective_message.reply_html(
             resp_text,
-            reply_markup=InlineKeyboardMarkup(copy_btns) if copy_btns else None,
             disable_web_page_preview=True,
         )
 
@@ -412,13 +411,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 if target_uid:
                     new_card_text += f"🎯 指定接收人: <code>{target_uid}</code>\n"
                 new_card_text += "\n<i>点击下方按钮即可进入 Bot 领取内容并一键复制。</i>"
+                btn_lbl = f"🎁 领取 ({claimed}/{max_v})" if max_v > 1 else "🎁 领取"
                 with suppress(Exception):
                     await context.bot.edit_message_text(
                         inline_message_id=imid,
                         text=new_card_text,
                         parse_mode=ParseMode.HTML,
                         reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton(f"🎁 进入 Bot 领取 ({claimed}/{max_v})", url=f"https://t.me/{bot_username}?start=claim_{code}")]
+                            [InlineKeyboardButton(btn_lbl, url=f"https://t.me/{bot_username}?start=claim_{code}")]
                         ]),
                     )
 
@@ -1554,10 +1554,9 @@ async def start_http(app: Application) -> web.AppRunner:
     return runner
 
 
-def format_split_share_content(raw_content: str) -> tuple[str, list[list[InlineKeyboardButton]]]:
-    """把私密分享内容格式化为彼此隔离的独立代码框，并生成专属单项复制按钮，防止连带全选。"""
+def format_split_share_content(raw_content: str) -> str:
+    """把私密分享内容格式化为彼此隔离的独立代码框，轻触即可单独复制，防止连带全选。"""
     lines = [line.strip() for line in raw_content.splitlines() if line.strip()]
-    copy_buttons: list[list[InlineKeyboardButton]] = []
     body_parts: list[str] = []
 
     # 1. 检测是否为格式化的订阅包（含名称、原链、Clash配置等）
@@ -1578,27 +1577,17 @@ def format_split_share_content(raw_content: str) -> tuple[str, list[list[InlineK
             # 每一项单独使用代码框包裹，并且中间空一行做物理隔离
             body_parts.append(f"<b>{html.escape(label)}：</b>\n<code>{html.escape(val)}</code>")
 
-            # 如果是具体链接或名称，挂一个独立的复制按钮
-            btn_title = f"📋 复制{label[:6]}"
-            copy_buttons.append([InlineKeyboardButton(btn_title, copy_text=CopyTextButton(text=val))])
-
-        body_text = "\n\n".join(body_parts)
-        return body_text, copy_buttons
+        return "\n\n".join(body_parts)
 
     # 2. 检测是否为多行节点或多条链接
     if len(lines) > 1:
         for i, l in enumerate(lines, 1):
             body_parts.append(f"<b>片段 #{i}：</b>\n<code>{html.escape(l)}</code>")
-            if i <= 8:  # 限制按钮行数，防消息过长
-                copy_buttons.append([InlineKeyboardButton(f"📋 复制片段 #{i}", copy_text=CopyTextButton(text=l))])
-        body_text = "\n\n".join(body_parts)
-        return body_text, copy_buttons
+        return "\n\n".join(body_parts)
 
-    # 3. 单条内容：单一隔离框 + 单一复制按钮
+    # 3. 单条内容：单一隔离框
     single_val = raw_content.strip()
-    body_text = f"<b>内容如下：</b>\n<code>{html.escape(single_val)}</code>"
-    copy_buttons.append([InlineKeyboardButton("📋 一键复制内容", copy_text=CopyTextButton(text=single_val))])
-    return body_text, copy_buttons
+    return f"<b>内容如下：</b>\n<code>{html.escape(single_val)}</code>"
 
 
 def parse_share_query(raw: str) -> tuple[int, int | None, int, str] | None:
@@ -1698,7 +1687,8 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             if target_user_id:
                 msg_text += f"🎯 指定接收人: <code>{target_user_id}</code>\n"
-            msg_text += "\n<i>点击下方按钮即可查看私密内容（防公开泄漏）。</i>"
+            msg_text += "\n<i>点击下方按钮即可进入 Bot 领取。</i>"
+            btn_lbl = f"🎁 领取 (0/{max_views})" if max_views > 1 else "🎁 领取"
 
             results.append(
                 InlineQueryResultArticle(
@@ -1707,7 +1697,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     description=card_desc[:100],
                     input_message_content=InputTextMessageContent(msg_text, parse_mode=ParseMode.HTML),
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{bot_username}?start=claim_{code}")],
+                        [InlineKeyboardButton(btn_lbl, url=f"https://t.me/{bot_username}?start=claim_{code}")],
                     ]),
                 )
             )
@@ -1731,7 +1721,8 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         if target_user_id:
             msg_text_custom += f"🎯 指定接收人: <code>{target_user_id}</code>\n"
-        msg_text_custom += "\n<i>点击下方按钮即可查看私密内容（防公开泄漏）。</i>"
+        msg_text_custom += "\n<i>点击下方按钮即可进入 Bot 领取。</i>"
+        btn_lbl_txt = f"🎁 领取 (0/{max_views})" if max_views > 1 else "🎁 领取"
 
         results.append(
             InlineQueryResultArticle(
@@ -1740,7 +1731,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 description=card_desc_text[:100],
                 input_message_content=InputTextMessageContent(msg_text_custom, parse_mode=ParseMode.HTML),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{bot_username}?start=claim_{code_text}")],
+                    [InlineKeyboardButton(btn_lbl_txt, url=f"https://t.me/{bot_username}?start=claim_{code_text}")],
                 ]),
             )
         )
