@@ -64,6 +64,24 @@ CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS shares (
+    code TEXT PRIMARY KEY,
+    sender_id INTEGER NOT NULL,
+    sender_name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    max_views INTEGER NOT NULL DEFAULT 1,
+    claimed_count INTEGER NOT NULL DEFAULT 0,
+    target_user_id INTEGER,
+    expire_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS share_claims (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    share_code TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    claimed_at INTEGER NOT NULL,
+    UNIQUE(share_code, user_id)
+);
 """
 
 
@@ -311,6 +329,79 @@ class Store:
             cur = await db.execute("SELECT * FROM short_links WHERE code=?", (code,))
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def create_share(
+        self,
+        sender_id: int,
+        sender_name: str,
+        content: str,
+        max_views: int = 1,
+        target_user_id: int | None = None,
+        duration_minutes: int = 10,
+    ) -> str:
+        code = secrets.token_urlsafe(8)
+        now = int(time.time())
+        expire_at = now + max(1, duration_minutes) * 60
+        async with self.connection() as db:
+            await db.execute(
+                """INSERT INTO shares
+                (code, sender_id, sender_name, content, max_views, claimed_count, target_user_id, expire_at, created_at)
+                VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)""",
+                (code, sender_id, sender_name, content, max_views, target_user_id, expire_at, now),
+            )
+            await db.commit()
+        return code
+
+    async def get_share(self, code: str) -> dict[str, Any] | None:
+        async with self.connection() as db:
+            cur = await db.execute("SELECT * FROM shares WHERE code=?", (code,))
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def claim_share(self, code: str, user_id: int) -> tuple[bool, str, dict[str, Any] | None]:
+        """Claim a share item.
+
+        Returns (success, message, share_dict).
+        """
+        now = int(time.time())
+        async with self.connection() as db:
+            cur = await db.execute("SELECT * FROM shares WHERE code=?", (code,))
+            row = await cur.fetchone()
+            if not row:
+                return False, "分享不存在或已被删除", None
+            share = dict(row)
+
+            if share["expire_at"] < now:
+                return False, "⚠️ 该分享已过期！", share
+
+            if share["target_user_id"] and share["target_user_id"] != user_id:
+                return False, f"🚫 仅指定用户 (ID: {share['target_user_id']}) 可查看！", share
+
+            # 检查是否该用户已经领取过
+            cur = await db.execute(
+                "SELECT 1 FROM share_claims WHERE share_code=? AND user_id=?", (code, user_id)
+            )
+            if await cur.fetchone():
+                # 已领过的人可重复查看内容，但不扣减份数
+                return True, "已再次查看", share
+
+            if share["claimed_count"] >= share["max_views"]:
+                return False, "⚠️ 份数已领完！", share
+
+            # 记录领取
+            await db.execute(
+                "INSERT INTO share_claims(share_code, user_id, claimed_at) VALUES(?, ?, ?)",
+                (code, user_id, now),
+            )
+            await db.execute(
+                "UPDATE shares SET claimed_count = claimed_count + 1 WHERE code=?", (code,)
+            )
+            await db.commit()
+
+            # 重新拉取最新数据
+            cur = await db.execute("SELECT * FROM shares WHERE code=?", (code,))
+            share = dict(await cur.fetchone())
+            return True, "领取成功", share
 
 
 def nodes_of(sub: dict[str, Any]) -> list[dict[str, Any]]:
