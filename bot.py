@@ -26,6 +26,7 @@ from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChosenInlineResultHandler,
     CommandHandler,
     ContextTypes,
     InlineQueryHandler,
@@ -383,6 +384,44 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=InlineKeyboardMarkup(copy_btns) if copy_btns else None,
             disable_web_page_preview=True,
         )
+
+        # ── 同步更新群聊里的原卡片消息 (若已捕获 inline_message_id) ───────────────────
+        imid = share.get("inline_message_id")
+        if imid:
+            bot_username = get_bot_username(context.bot)
+            target_uid = share.get("target_user_id")
+            if claimed >= max_v:
+                new_card_text = (
+                    "🔒 <b>私密分享 (已领完)</b>\n\n"
+                    f"👤 来自: {sender}\n"
+                    f"📦 份数: <code>{claimed}/{max_v}</code> (已满)\n"
+                    "<i>此分享已全部被领取。</i>"
+                )
+                with suppress(Exception):
+                    await context.bot.edit_message_text(
+                        inline_message_id=imid,
+                        text=new_card_text,
+                        parse_mode=ParseMode.HTML,
+                    )
+            else:
+                new_card_text = (
+                    "🔒 <b>私密分享</b>\n\n"
+                    f"👤 来自: {sender}\n"
+                    f"📦 份数: <code>{claimed}/{max_v}</code>\n"
+                )
+                if target_uid:
+                    new_card_text += f"🎯 指定接收人: <code>{target_uid}</code>\n"
+                new_card_text += "\n<i>点击下方按钮即可进入 Bot 领取内容并一键复制。</i>"
+                with suppress(Exception):
+                    await context.bot.edit_message_text(
+                        inline_message_id=imid,
+                        text=new_card_text,
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=InlineKeyboardMarkup([
+                            [InlineKeyboardButton(f"🎁 进入 Bot 领取 ({claimed}/{max_v})", url=f"https://t.me/{bot_username}?start=claim_{code}")]
+                        ]),
+                    )
+
         return
 
     # 无单次授权参数时，严格执行管理员白名单检查
@@ -1669,7 +1708,6 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     input_message_content=InputTextMessageContent(msg_text, parse_mode=ParseMode.HTML),
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{bot_username}?start=claim_{code}")],
-                        [InlineKeyboardButton("👀 快速弹窗预览", callback_data=f"share:c:{code}")],
                     ]),
                 )
             )
@@ -1703,7 +1741,6 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 input_message_content=InputTextMessageContent(msg_text_custom, parse_mode=ParseMode.HTML),
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("🎁 进入 Bot 领取 (一键复制)", url=f"https://t.me/{bot_username}?start=claim_{code_text}")],
-                    [InlineKeyboardButton("👀 快速弹窗预览", callback_data=f"share:c:{code_text}")],
                 ]),
             )
         )
@@ -1754,6 +1791,18 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await iq.answer(results[:50], cache_time=10, is_personal=True)
 
 
+async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """当用户把内联私密卡片发送到聊天中时，记录其 inline_message_id，以便核销后原地更新群消息。"""
+    cir = update.chosen_inline_result
+    if not cir or not cir.inline_message_id:
+        return
+    res_id = cir.result_id or ""
+    # 我们生成的 id 形如 share_sub_{code} 或 share_txt_{code}
+    if res_id.startswith("share_sub_") or res_id.startswith("share_txt_"):
+        code = res_id.split("_", 2)[-1]
+        await store.bind_inline_message_id(code, cir.inline_message_id)
+
+
 def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1772,6 +1821,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("ai", cmd_api_test))
     app.add_handler(CommandHandler("temp", cmd_temp))
     app.add_handler(InlineQueryHandler(on_inline_query))
+    app.add_handler(ChosenInlineResultHandler(on_chosen_inline_result))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

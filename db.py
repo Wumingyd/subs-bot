@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS shares (
     max_views INTEGER NOT NULL DEFAULT 1,
     claimed_count INTEGER NOT NULL DEFAULT 0,
     target_user_id INTEGER,
+    inline_message_id TEXT,
     expire_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
 );
@@ -95,6 +96,11 @@ class Store:
         db.row_factory = aiosqlite.Row
         try:
             await db.executescript(SCHEMA)
+            # 安全迁移：为现有数据库补全 inline_message_id 列
+            try:
+                await db.execute("ALTER TABLE shares ADD COLUMN inline_message_id TEXT")
+            except Exception:
+                pass
             await db.commit()
             yield db
         finally:
@@ -357,6 +363,14 @@ class Store:
             cur = await db.execute("SELECT * FROM shares WHERE code=?", (code,))
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    async def bind_inline_message_id(self, code: str, inline_message_id: str) -> bool:
+        async with self.connection() as db:
+            cur = await db.execute(
+                "UPDATE shares SET inline_message_id=? WHERE code=?", (inline_message_id, code)
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
     async def claim_share(self, code: str, user_id: int) -> tuple[bool, str, dict[str, Any] | None]:
         """Claim a share item.
