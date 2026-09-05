@@ -269,7 +269,10 @@ def detail_keyboard(sub_id: int, page: int = 0, node_count: int = 0) -> InlineKe
             InlineKeyboardButton("Surge", callback_data=f"sub:fmt:{sub_id}:surge"),
         ],
         [InlineKeyboardButton("QX", callback_data=f"sub:fmt:{sub_id}:qx")],
-        [InlineKeyboardButton("🔄 刷新订阅", callback_data=f"sub:refresh:{sub_id}:{page}")],
+        [
+            InlineKeyboardButton("🔄 刷新订阅", callback_data=f"sub:refresh:{sub_id}:{page}"),
+            InlineKeyboardButton("✏️ 重命名", callback_data=f"sub:rename:{sub_id}:{page}"),
+        ],
         [
             InlineKeyboardButton("📦 导出节点", callback_data=f"sub:nodes:{sub_id}"),
             InlineKeyboardButton("🔗 生成短链", callback_data=f"sub:short:{sub_id}"),
@@ -931,6 +934,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.effective_message.reply_text("已取消当前操作。", reply_markup=MAIN_KB)
             return
 
+    # ── 订阅重命名状态机 ─────────────────────────
+    if state == "sub_rename":
+        sub_id = (context.user_data or {}).pop("rename_sub_id", None)
+        page = (context.user_data or {}).pop("rename_page", 0)
+        context.user_data.pop("await", None)
+        new_name = text.strip()
+        if not new_name or len(new_name) > 64:
+            await update.effective_message.reply_text("❌ 名称不能为空且不能超过 64 个字符，重命名已取消。", reply_markup=MAIN_KB)
+            return
+        updated = await store.update_sub(user_id, sub_id, name=new_name)
+        if not updated:
+            await update.effective_message.reply_text("❌ 订阅不存在或已被删除。", reply_markup=MAIN_KB)
+            return
+        subs = await store.list_subs(user_id)
+        idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == sub_id), sub_id)
+        await update.effective_message.reply_html(
+            f"✅ 订阅名称已更新为：<b>{html.escape(new_name)}</b>\n\n" + detail_text(updated, idx),
+            reply_markup=detail_keyboard(sub_id, page, len(nodes_of(updated))),
+            disable_web_page_preview=True,
+        )
+        return
+
     # ── 页码跳转状态机 ──────────────────────────────
     if state == "list_jump":
         context.user_data.pop("await", None)
@@ -1075,6 +1100,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if "|" in text and re.search(r"https?://", text):
         name, url = [x.strip() for x in text.split("|", 1)]
         if re.match(r"^https?://", url):
+            clean_url = url.rstrip("/")
+            existing = [s for s in await store.list_subs(user_id) if s["url"].rstrip("/") == clean_url]
+            if existing:
+                sub = existing[0]
+                if name:
+                    await store.update_sub(user_id, int(sub["id"]), name=name)
+                sub = await refresh_sub(user_id, sub, rename=not bool(name))
+                subs = await store.list_subs(user_id)
+                idx = next((i for i, s in enumerate(subs, 1) if int(s["id"]) == int(sub["id"])), 1)
+                await update.effective_message.reply_html(
+                    f"🔄 <b>订阅已存在，已为您自动更新！</b>\n\n#{idx} <b>{html.escape(sub['name'])}</b>\n节点数: {len(nodes_of(sub))}",
+                    reply_markup=MAIN_KB,
+                )
+                return
+
             sub = await store.add_sub(user_id, name or urlparse(url).netloc or "订阅", url)
             sub = await refresh_sub(user_id, sub, rename=not bool(name))
             await update.effective_message.reply_html(
@@ -1087,12 +1127,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     urls = re.findall(r"https?://\S+", text)
     if urls and not extract_share_links(text):
         added = []
+        updated_list = []
+        existing_subs = await store.list_subs(user_id)
+        existing_url_map = {s["url"].rstrip("/"): s for s in existing_subs}
+
         for url in urls:
-            name = urlparse(url).netloc or "订阅"
-            sub = await store.add_sub(user_id, name, url)
-            sub = await refresh_sub(user_id, sub, rename=True)
-            added.append(f"{sub['name']} ({len(nodes_of(sub))} 节点)")
-        await update.effective_message.reply_text("✅ 已添加:\n" + "\n".join(added), reply_markup=MAIN_KB)
+            clean_url = url.rstrip("/")
+            if clean_url in existing_url_map:
+                old_sub = existing_url_map[clean_url]
+                refreshed = await refresh_sub(user_id, old_sub, rename=True)
+                updated_list.append(f"{refreshed['name']} ({len(nodes_of(refreshed))} 节点)")
+            else:
+                name = urlparse(url).netloc or "订阅"
+                sub = await store.add_sub(user_id, name, url)
+                sub = await refresh_sub(user_id, sub, rename=True)
+                added.append(f"{sub['name']} ({len(nodes_of(sub))} 节点)")
+
+        msg_lines = []
+        if added:
+            msg_lines.append("✅ 已添加新增订阅:\n" + "\n".join(added))
+        if updated_list:
+            msg_lines.append("🔄 检测到重复订阅，已为您自动更新:\n" + "\n".join(updated_list))
+        await update.effective_message.reply_text("\n\n".join(msg_lines), reply_markup=MAIN_KB)
         return
 
     # node share links
@@ -1149,13 +1205,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if structured:
         name = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0][:64] or "导入配置"
-        local = await store.add_imported_sub(user_id, name, parsed_nodes[:MAX_IMPORTED_NODES])
-        created.append((str(local["name"]), len(parsed_nodes[:MAX_IMPORTED_NODES])))
+        # 结构化配置去重：如果已有同名本地配置，直接更新其节点，避免重复创建
+        existing_imported = [s for s in await store.list_subs(user_id) if s.get("name") == name and s.get("url", "").startswith("uploaded://")]
+        if existing_imported:
+            old_sub = existing_imported[0]
+            await store.update_sub(user_id, int(old_sub["id"]), nodes_json=json.dumps(parsed_nodes[:MAX_IMPORTED_NODES], ensure_ascii=False))
+            created.append((f"{name} (已覆盖更新)", len(parsed_nodes[:MAX_IMPORTED_NODES])))
+        else:
+            local = await store.add_imported_sub(user_id, name, parsed_nodes[:MAX_IMPORTED_NODES])
+            created.append((str(local["name"]), len(parsed_nodes[:MAX_IMPORTED_NODES])))
     else:
+        existing_url_norm = {sub["url"].rstrip("/"): sub for sub in await store.list_subs(user_id)}
         urls = _unique(value.rstrip(".,;:!?)]}>\"\'") for value in re.findall(r"https?://[^\s<>\"]+", text))
         for url in urls[:MAX_IMPORTED_SUBSCRIPTIONS]:
-            if url in existing_urls:
-                skipped += 1
+            clean_url = url.rstrip("/")
+            if clean_url in existing_url_norm:
+                old_sub = existing_url_norm[clean_url]
+                try:
+                    updated = await refresh_sub(user_id, old_sub, rename=True)
+                    created.append((f"{updated['name']} (已更新)", len(nodes_of(updated))))
+                except Exception:
+                    skipped += 1
                 continue
             name = urlparse(url).netloc or "订阅"
             try:
@@ -1207,22 +1277,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     )
             return
 
-        # 成功：尝试通过私聊把内容发给他 (各字段独立隔离 + 专属单项复制按钮)
+        # 成功：尝试通过私聊把内容发给他 (各字段独立隔离灰框，轻触即可单独复制)
         sent_pm = False
         pm_err = ""
-        split_body, copy_btns = format_split_share_content(share["content"])
+        split_body = format_split_share_content(share["content"])
         pm_text = (
             "🎁 <b>您领取的私密分享内容如下：</b>\n"
             f"👤 来自: {html.escape(share.get('sender_name') or '用户')}\n\n"
             f"{split_body}\n\n"
-            "<i>💡 各项已做物理隔离，轻触上方独立灰框或点击下方按钮，仅复制单项。</i>"
+            "<i>💡 轻触上方灰底内容即可直接复制。</i>"
         )
         try:
             await context.bot.send_message(
                 chat_id=user_id,
                 text=pm_text,
                 parse_mode=ParseMode.HTML,
-                reply_markup=InlineKeyboardMarkup(copy_btns) if copy_btns else None,
                 disable_web_page_preview=True,
             )
             sent_pm = True
@@ -1233,14 +1302,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if sent_pm:
             alert_msg = (
                 f"🎁 领取成功！\n\n"
-                f"内容已私信发送到 @{bot_user}，并提供独立单项复制按钮，防止连带全选！\n\n"
+                f"内容已私信送达 @{bot_user}，轻触私信灰底框即可一键复制！\n\n"
                 f"预览：\n{share['content']}"
             )
         else:
             alert_msg = (
                 f"🎁 领取成功！\n\n"
                 f"{share['content']}\n\n"
-                f"⚠️ 无法向您发送私信（请先点击 @{bot_user} 发送 /start 启用私聊后即可独立复制单项）"
+                f"💡 建议先去 @{bot_user} 发送 /start 启用私聊，以后领取自动送达私聊可直接复制！"
             )
 
         # 截断防超过 Telegram 弹窗字数限制
@@ -1260,7 +1329,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "<i>此分享已全部被领取。</i>"
             )
             with suppress(Exception):
-                await q.edit_message_text(new_text, parse_mode=ParseMode.HTML)
+                await q.edit_message_text(
+                    new_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔒 已领完", callback_data="noop")]
+                    ]),
+                )
         else:
             new_text = (
                 "🔒 <b>私密分享</b>\n\n"
@@ -1269,13 +1344,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             if target_uid:
                 new_text += f"🎯 指定接收人: <code>{target_uid}</code>\n"
-            new_text += "\n<i>点击下方按钮即可查看私密内容（防公开泄漏）。</i>"
+            new_text += "\n<i>点击下方按钮即可进入 Bot 领取。</i>"
             with suppress(Exception):
                 await q.edit_message_text(
                     new_text,
                     parse_mode=ParseMode.HTML,
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(f"🎁 点击查看 ({claimed}/{max_v})", callback_data=f"share:c:{code}")]
+                        [InlineKeyboardButton(f"🎁 领取 ({claimed}/{max_v})", callback_data=f"share:c:{code}")]
                     ]),
                 )
         return
@@ -1471,6 +1546,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             parse_mode=ParseMode.HTML,
             reply_markup=detail_keyboard(sub_id, page, len(nodes_of(sub))),
             disable_web_page_preview=True,
+        )
+        return
+    if data.startswith("sub:rename:"):
+        parts = data.split(":")
+        sub_id = int(parts[2])
+        page = int(parts[3]) if len(parts) > 3 else 0
+        sub = await store.get_sub(user_id, sub_id)
+        if not sub:
+            await q.edit_message_text("订阅不存在")
+            return
+        if context.user_data is not None:
+            context.user_data["await"] = "sub_rename"
+            context.user_data["rename_sub_id"] = sub_id
+            context.user_data["rename_page"] = page
+        await q.message.reply_text(
+            f"✏️ 请发送订阅「<b>{html.escape(sub['name'])}</b>」的新名称：\n<i>（输入 取消 可退出）</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_KB,
         )
         return
     if data.startswith("sub:delask:"):
@@ -1762,7 +1855,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     description=card_desc[:100],
                     input_message_content=InputTextMessageContent(msg_text, parse_mode=ParseMode.HTML),
                     reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton(btn_lbl, url=f"https://t.me/{bot_username}?start=claim_{code}")],
+                        [InlineKeyboardButton(btn_lbl, callback_data=f"share:c:{code}")],
                     ]),
                 )
             )
@@ -1796,7 +1889,7 @@ async def on_inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 description=card_desc_text[:100],
                 input_message_content=InputTextMessageContent(msg_text_custom, parse_mode=ParseMode.HTML),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(btn_lbl_txt, url=f"https://t.me/{bot_username}?start=claim_{code_text}")],
+                    [InlineKeyboardButton(btn_lbl_txt, callback_data=f"share:c:{code_text}")],
                 ]),
             )
         )
